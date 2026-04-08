@@ -250,6 +250,11 @@ func (s *server) toolListModels() mcpToolResult {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return errResult(fmt.Sprintf("Ollama returned %d: %s", resp.StatusCode, string(b)))
+	}
+
 	var tags ollamaTagsResp
 	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
 		return errResult("failed to parse response: " + err.Error())
@@ -401,9 +406,13 @@ func (s *server) toolEmbed(args map[string]any) mcpToolResult {
 	}
 
 	emb := result.Embeddings[0]
+	preview := emb
+	if len(preview) > 16 {
+		preview = preview[:16]
+	}
 	out, _ := json.Marshal(map[string]any{
 		"dimensions": len(emb),
-		"embeddings": emb,
+		"preview":    preview,
 	})
 	return textResult(string(out))
 }
@@ -427,7 +436,7 @@ func (s *server) errorResult(id json.RawMessage, msg string) rpcResponse {
 	return rpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
-		Error:   &rpcError{Code: -32600, Message: msg},
+		Error:   &rpcError{Code: -32602, Message: msg},
 	}
 }
 
