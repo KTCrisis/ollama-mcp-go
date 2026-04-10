@@ -63,8 +63,10 @@ type mcpContent struct {
 }
 
 type mcpToolResult struct {
-	Content []mcpContent `json:"content"`
-	IsError bool         `json:"isError,omitempty"`
+	Content         []mcpContent `json:"content"`
+	IsError         bool         `json:"isError,omitempty"`
+	PromptEvalCount int          `json:"prompt_eval_count,omitempty"`
+	EvalCount       int          `json:"eval_count,omitempty"`
 }
 
 // --- Ollama API types ---
@@ -77,7 +79,9 @@ type ollamaGenerateReq struct {
 }
 
 type ollamaGenerateResp struct {
-	Response string `json:"response"`
+	Response        string `json:"response"`
+	PromptEvalCount int    `json:"prompt_eval_count"`
+	EvalCount       int    `json:"eval_count"`
 }
 
 type ollamaChatMessage struct {
@@ -92,7 +96,9 @@ type ollamaChatReq struct {
 }
 
 type ollamaChatResp struct {
-	Message ollamaChatMessage `json:"message"`
+	Message         ollamaChatMessage `json:"message"`
+	PromptEvalCount int               `json:"prompt_eval_count"`
+	EvalCount       int               `json:"eval_count"`
 }
 
 type ollamaEmbedReq struct {
@@ -306,7 +312,10 @@ func (s *server) toolGenerate(args map[string]any) mcpToolResult {
 		return errResult("failed to parse response: " + err.Error())
 	}
 
-	return textResult(result.Response)
+	out := textResult(result.Response)
+	out.PromptEvalCount = result.PromptEvalCount
+	out.EvalCount = result.EvalCount
+	return out
 }
 
 func (s *server) toolChat(args map[string]any) mcpToolResult {
@@ -365,7 +374,10 @@ func (s *server) toolChat(args map[string]any) mcpToolResult {
 		return errResult("failed to parse response: " + err.Error())
 	}
 
-	return textResult(result.Message.Content)
+	out := textResult(result.Message.Content)
+	out.PromptEvalCount = result.PromptEvalCount
+	out.EvalCount = result.EvalCount
+	return out
 }
 
 func (s *server) toolEmbed(args map[string]any) mcpToolResult {
