@@ -68,7 +68,40 @@ func TestToolsCallUnknown(t *testing.T) {
 	}
 }
 
+// TestMain keeps the trace file out of the way: tests must not append to the
+// real /tmp/ollama-mcp-trace.log. TestTraceFile opts back in explicitly.
+func TestMain(m *testing.M) {
+	os.Setenv("OLLAMA_MCP_TRACE", "off")
+	os.Exit(m.Run())
+}
+
 // --- Tool implementation tests (with mock Ollama) ---
+
+// writeNDJSON emits text the way Ollama does when stream is true: one JSON
+// object per line, split across several chunks, then a final done:true line
+// carrying the usage counters.
+func writeNDJSON(w http.ResponseWriter, text string, chat bool) {
+	enc := json.NewEncoder(w)
+	for _, tok := range strings.SplitAfter(text, " ") {
+		if tok == "" {
+			continue
+		}
+		chunk := map[string]any{"done": false}
+		if chat {
+			chunk["message"] = map[string]any{"role": "assistant", "content": tok}
+		} else {
+			chunk["response"] = tok
+		}
+		enc.Encode(chunk)
+	}
+	final := map[string]any{"done": true, "prompt_eval_count": 7, "eval_count": 11}
+	if chat {
+		final["message"] = map[string]any{"role": "assistant", "content": ""}
+	} else {
+		final["response"] = ""
+	}
+	enc.Encode(final)
+}
 
 func mockOllama(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -92,11 +125,11 @@ func mockOllama(t *testing.T) *httptest.Server {
 				http.Error(w, `{"error":"model required"}`, 400)
 				return
 			}
-			resp := ollamaGenerateResp{Response: fmt.Sprintf("mock response to: %s", req.Prompt)}
+			text := fmt.Sprintf("mock response to: %s", req.Prompt)
 			if req.System != "" {
-				resp.Response = fmt.Sprintf("[system:%s] %s", req.System, resp.Response)
+				text = fmt.Sprintf("[system:%s] %s", req.System, text)
 			}
-			json.NewEncoder(w).Encode(resp)
+			writeNDJSON(w, text, false)
 
 		case "/api/chat":
 			var req ollamaChatReq
@@ -106,9 +139,7 @@ func mockOllama(t *testing.T) *httptest.Server {
 				return
 			}
 			last := req.Messages[len(req.Messages)-1].Content
-			json.NewEncoder(w).Encode(ollamaChatResp{
-				Message: ollamaChatMessage{Role: "assistant", Content: fmt.Sprintf("mock chat reply to: %s", last)},
-			})
+			writeNDJSON(w, fmt.Sprintf("mock chat reply to: %s", last), true)
 
 		case "/api/embed":
 			var req ollamaEmbedReq
@@ -321,6 +352,134 @@ func TestEmbedMissingParams(t *testing.T) {
 	result = s.toolEmbed(map[string]any{"text": "x"})
 	if !result.IsError {
 		t.Error("expected error for missing model")
+	}
+}
+
+// --- Streaming tests ---
+
+// The reply arrives split across several NDJSON lines; the tool must hand back
+// one reassembled string, and the counters only present on the final chunk.
+func TestStreamReassembly(t *testing.T) {
+	s, cleanup := testServer(t)
+	defer cleanup()
+
+	result := s.toolGenerate(map[string]any{
+		"model":  "testmodel:7b",
+		"prompt": "one two three",
+	})
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+	if got := result.Content[0].Text; got != "mock response to: one two three" {
+		t.Errorf("chunks not reassembled cleanly, got: %q", got)
+	}
+	if result.PromptEvalCount != 7 || result.EvalCount != 11 {
+		t.Errorf("usage counters lost: prompt=%d eval=%d", result.PromptEvalCount, result.EvalCount)
+	}
+}
+
+func TestChatStreamCounters(t *testing.T) {
+	s, cleanup := testServer(t)
+	defer cleanup()
+
+	result := s.toolChat(map[string]any{
+		"model":    "testmodel:7b",
+		"messages": []any{map[string]any{"role": "user", "content": "bonjour"}},
+	})
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+	if result.EvalCount != 11 {
+		t.Errorf("expected eval count 11, got %d", result.EvalCount)
+	}
+}
+
+func TestTraceFile(t *testing.T) {
+	s, cleanup := testServer(t)
+	defer cleanup()
+
+	path := t.TempDir() + "/trace.log"
+	t.Setenv("OLLAMA_MCP_TRACE", path)
+
+	result := s.toolGenerate(map[string]any{
+		"model":  "testmodel:7b",
+		"prompt": "hello",
+	})
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("trace file not written: %v", err)
+	}
+	trace := string(data)
+	for _, want := range []string{"generate", "testmodel:7b", "> hello", "mock response to: hello", "[done: 7 prompt / 11 eval]"} {
+		if !strings.Contains(trace, want) {
+			t.Errorf("trace missing %q, got:\n%s", want, trace)
+		}
+	}
+}
+
+func TestTraceOff(t *testing.T) {
+	if traceFile() != "" {
+		t.Errorf("expected tracing off, got path %q", traceFile())
+	}
+	t.Setenv("OLLAMA_MCP_TRACE", "")
+	if traceFile() != defaultTracePath {
+		t.Errorf("expected default path, got %q", traceFile())
+	}
+}
+
+// Reasoning tokens belong in the trace and nowhere else: the MCP client must
+// receive the answer alone.
+func TestThinkingStaysOutOfReply(t *testing.T) {
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enc := json.NewEncoder(w)
+		enc.Encode(map[string]any{"done": false, "message": map[string]any{"role": "assistant", "thinking": "the user wants ", "content": ""}})
+		enc.Encode(map[string]any{"done": false, "message": map[string]any{"role": "assistant", "thinking": "a greeting", "content": ""}})
+		enc.Encode(map[string]any{"done": false, "message": map[string]any{"role": "assistant", "content": "bonjour"}})
+		enc.Encode(map[string]any{"done": true, "message": map[string]any{"role": "assistant", "content": ""}, "prompt_eval_count": 3, "eval_count": 9})
+	}))
+	defer mock.Close()
+
+	path := t.TempDir() + "/trace.log"
+	t.Setenv("OLLAMA_MCP_TRACE", path)
+	s := &server{ollamaURL: mock.URL, client: mock.Client()}
+
+	result := s.toolChat(map[string]any{
+		"model":    "testmodel:7b",
+		"messages": []any{map[string]any{"role": "user", "content": "salue"}},
+	})
+	if result.IsError {
+		t.Fatalf("unexpected error: %s", result.Content[0].Text)
+	}
+	if got := result.Content[0].Text; got != "bonjour" {
+		t.Errorf("reasoning leaked into the reply: %q", got)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("trace file not written: %v", err)
+	}
+	trace := string(data)
+	for _, want := range []string{"--- pense ---", "the user wants a greeting", "--- repond ---", "bonjour"} {
+		if !strings.Contains(trace, want) {
+			t.Errorf("trace missing %q, got:\n%s", want, trace)
+		}
+	}
+}
+
+func TestChatEmptyMessages(t *testing.T) {
+	s, cleanup := testServer(t)
+	defer cleanup()
+
+	result := s.toolChat(map[string]any{
+		"model":    "testmodel:7b",
+		"messages": []any{},
+	})
+	if !result.IsError {
+		t.Error("expected error for empty messages array, not a panic")
 	}
 }
 

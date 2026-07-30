@@ -23,10 +23,10 @@ type rpcRequest struct {
 }
 
 type rpcResponse struct {
-	JSONRPC string `json:"jsonrpc"`
+	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
-	Result  any    `json:"result,omitempty"`
-	Error   *rpcError `json:"error,omitempty"`
+	Result  any             `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
 }
 
 type rpcError struct {
@@ -43,9 +43,9 @@ type mcpTool struct {
 }
 
 type mcpSchema struct {
-	Type       string                `json:"type"`
-	Properties map[string]mcpProp    `json:"properties"`
-	Required   []string              `json:"required,omitempty"`
+	Type       string             `json:"type"`
+	Properties map[string]mcpProp `json:"properties"`
+	Required   []string           `json:"required,omitempty"`
 }
 
 type mcpProp struct {
@@ -78,15 +78,13 @@ type ollamaGenerateReq struct {
 	Stream bool   `json:"stream"`
 }
 
-type ollamaGenerateResp struct {
-	Response        string `json:"response"`
-	PromptEvalCount int    `json:"prompt_eval_count"`
-	EvalCount       int    `json:"eval_count"`
-}
-
 type ollamaChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Thinking carries the reasoning of models that emit a separate channel
+	// (gpt-oss and friends). It is only ever received, never sent — omitempty
+	// keeps it out of requests.
+	Thinking string `json:"thinking,omitempty"`
 }
 
 type ollamaChatReq struct {
@@ -95,10 +93,23 @@ type ollamaChatReq struct {
 	Stream   bool                `json:"stream"`
 }
 
-type ollamaChatResp struct {
+// ollamaStreamChunk is one NDJSON line of a streamed /api/generate or
+// /api/chat response. The two endpoints differ only in where they put the
+// text: "response" for generate, "message.content" for chat. A single struct
+// covers both — the unused field simply stays zero.
+type ollamaStreamChunk struct {
+	Response        string            `json:"response"`
 	Message         ollamaChatMessage `json:"message"`
+	Done            bool              `json:"done"`
 	PromptEvalCount int               `json:"prompt_eval_count"`
 	EvalCount       int               `json:"eval_count"`
+}
+
+func (c ollamaStreamChunk) token() string {
+	if c.Response != "" {
+		return c.Response
+	}
+	return c.Message.Content
 }
 
 type ollamaEmbedReq struct {
@@ -247,6 +258,135 @@ func (s *server) handleToolsCall(id json.RawMessage, params json.RawMessage) rpc
 	}
 }
 
+// --- Streaming ---
+
+// traceFile returns the path tokens are mirrored to as they arrive, or ""
+// when tracing is off. Watch it with: tail -f /tmp/ollama-mcp-trace.log
+func traceFile() string {
+	path := os.Getenv("OLLAMA_MCP_TRACE")
+	if path == "" {
+		return defaultTracePath
+	}
+	if path == "off" {
+		return ""
+	}
+	return path
+}
+
+const defaultTracePath = "/tmp/ollama-mcp-trace.log"
+
+// streamSink accumulates the full reply for the MCP response while mirroring
+// each token to the trace file. MCP cannot deliver a partial tool result, so
+// the file is the only way to watch a reply as it is being written.
+type streamSink struct {
+	f          *os.File
+	buf        strings.Builder
+	inThinking bool
+}
+
+// newStreamSink opens the trace file and writes a header. A file that cannot
+// be opened is not an error: tracing degrades to nothing and generation goes
+// on, since the caller wants the reply far more than it wants the log.
+func newStreamSink(kind, model, prompt string) *streamSink {
+	s := &streamSink{}
+	path := traceFile()
+	if path == "" {
+		return s
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		log.Printf("trace disabled: %v", err)
+		return s
+	}
+	s.f = f
+	fmt.Fprintf(f, "\n=== %s  %s  %s ===\n> %s\n---\n",
+		time.Now().Format("15:04:05"), kind, model, prompt)
+	return s
+}
+
+// write mirrors a token. os.File is unbuffered, so each call is a write(2)
+// syscall and reaches a `tail -f` immediately — buffering here would defeat
+// the whole point.
+func (s *streamSink) write(tok string) {
+	s.buf.WriteString(tok)
+	if s.f == nil {
+		return
+	}
+	if s.inThinking {
+		io.WriteString(s.f, "\n--- repond ---\n")
+		s.inThinking = false
+	}
+	io.WriteString(s.f, tok)
+}
+
+// writeThinking mirrors reasoning tokens to the trace only. They never reach
+// buf, so the MCP client still gets the answer alone — the trace is the one
+// place where the model's deliberation is visible.
+func (s *streamSink) writeThinking(tok string) {
+	if s.f == nil {
+		return
+	}
+	if !s.inThinking {
+		io.WriteString(s.f, "\n--- pense ---\n")
+		s.inThinking = true
+	}
+	io.WriteString(s.f, tok)
+}
+
+func (s *streamSink) close(promptEval, eval int) {
+	if s.f != nil {
+		fmt.Fprintf(s.f, "\n[done: %d prompt / %d eval]\n", promptEval, eval)
+		s.f.Close()
+		s.f = nil
+	}
+}
+
+func (s *streamSink) text() string { return s.buf.String() }
+
+// postStream sends body to path and consumes the NDJSON reply line by line,
+// feeding every token to sink. It returns the usage counters carried by the
+// final chunk.
+func (s *server) postStream(path string, body []byte, sink *streamSink) (promptEval, eval int, err error) {
+	resp, err := s.client.Post(s.ollamaURL+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return 0, 0, fmt.Errorf("Ollama request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		return 0, 0, fmt.Errorf("Ollama returned %d: %s", resp.StatusCode, string(b))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var chunk ollamaStreamChunk
+		if err := json.Unmarshal(line, &chunk); err != nil {
+			return 0, 0, fmt.Errorf("failed to parse stream chunk: %w", err)
+		}
+		if th := chunk.Message.Thinking; th != "" {
+			sink.writeThinking(th)
+		}
+		// An empty token must not reach write(): chunks that carry reasoning
+		// only would otherwise flip the sink out of thinking mode too early.
+		if tok := chunk.token(); tok != "" {
+			sink.write(tok)
+		}
+		if chunk.Done {
+			promptEval, eval = chunk.PromptEvalCount, chunk.EvalCount
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, 0, fmt.Errorf("stream read failed: %w", err)
+	}
+	return promptEval, eval, nil
+}
+
 // --- Tool implementations ---
 
 func (s *server) toolListModels() mcpToolResult {
@@ -290,31 +430,23 @@ func (s *server) toolGenerate(args map[string]any) mcpToolResult {
 		Model:  model,
 		Prompt: prompt,
 		System: system,
-		Stream: false,
+		Stream: true,
 	})
 	if err != nil {
 		return errResult("marshal error: " + err.Error())
 	}
 
-	resp, err := s.client.Post(s.ollamaURL+"/api/generate", "application/json", bytes.NewReader(body))
+	sink := newStreamSink("generate", model, prompt)
+	promptEval, eval, err := s.postStream("/api/generate", body, sink)
 	if err != nil {
-		return errResult("Ollama request failed: " + err.Error())
+		sink.close(0, 0)
+		return errResult(err.Error())
 	}
-	defer resp.Body.Close()
+	sink.close(promptEval, eval)
 
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return errResult(fmt.Sprintf("Ollama returned %d: %s", resp.StatusCode, string(b)))
-	}
-
-	var result ollamaGenerateResp
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return errResult("failed to parse response: " + err.Error())
-	}
-
-	out := textResult(result.Response)
-	out.PromptEvalCount = result.PromptEvalCount
-	out.EvalCount = result.EvalCount
+	out := textResult(sink.text())
+	out.PromptEvalCount = promptEval
+	out.EvalCount = eval
 	return out
 }
 
@@ -348,35 +480,30 @@ func (s *server) toolChat(args map[string]any) mcpToolResult {
 		}
 		messages = append(messages, ollamaChatMessage{Role: role, Content: content})
 	}
+	if len(messages) == 0 {
+		return errResult("'messages' must not be empty")
+	}
 
 	body, err := json.Marshal(ollamaChatReq{
 		Model:    model,
 		Messages: messages,
-		Stream:   false,
+		Stream:   true,
 	})
 	if err != nil {
 		return errResult("marshal error: " + err.Error())
 	}
 
-	resp, err := s.client.Post(s.ollamaURL+"/api/chat", "application/json", bytes.NewReader(body))
+	sink := newStreamSink("chat", model, messages[len(messages)-1].Content)
+	promptEval, eval, err := s.postStream("/api/chat", body, sink)
 	if err != nil {
-		return errResult("Ollama request failed: " + err.Error())
+		sink.close(0, 0)
+		return errResult(err.Error())
 	}
-	defer resp.Body.Close()
+	sink.close(promptEval, eval)
 
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return errResult(fmt.Sprintf("Ollama returned %d: %s", resp.StatusCode, string(b)))
-	}
-
-	var result ollamaChatResp
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return errResult("failed to parse response: " + err.Error())
-	}
-
-	out := textResult(result.Message.Content)
-	out.PromptEvalCount = result.PromptEvalCount
-	out.EvalCount = result.EvalCount
+	out := textResult(sink.text())
+	out.PromptEvalCount = promptEval
+	out.EvalCount = eval
 	return out
 }
 

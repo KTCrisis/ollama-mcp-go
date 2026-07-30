@@ -128,6 +128,39 @@ Once connected, your MCP client can call:
 | Env variable | Default | Description |
 |---|---|---|
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama API URL |
+| `OLLAMA_MCP_TRACE` | `/tmp/ollama-mcp-trace.log` | Where replies are mirrored as they stream. Set to `off` to disable. |
+
+## Watching a reply as it is written
+
+`generate` and `chat` stream from Ollama, but MCP has no way to deliver a
+partial tool result: the client receives the reply in one piece, at the end.
+So the server mirrors every token to a trace file the moment it arrives.
+
+```bash
+tail -f /tmp/ollama-mcp-trace.log
+```
+
+Each call writes a header, the prompt, the reply as it lands, and a footer
+with the token counts:
+
+```
+=== 21:15:33  chat  gpt-oss:20b ===
+> Dis bonjour en trois mots exactement.
+---
+--- pense ---
+Three words greeting: "Bonjour à tous" - Bonjour(1) à(2) tous(3)...
+--- repond ---
+Bonjour à tous.
+[done: 75 prompt / 201 eval]
+```
+
+Models that emit a separate reasoning channel (gpt-oss and friends) have it
+mirrored under `--- pense ---`. Reasoning **never** reaches the MCP client —
+it goes to the trace and nowhere else, so the answer stays clean while the
+deliberation stays visible.
+
+Failing to open the trace file is not fatal — tracing turns itself off and
+generation carries on.
 
 ## Protocol
 
