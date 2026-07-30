@@ -11,6 +11,7 @@ There are several Ollama MCP servers out there. This one exists because:
 - **Go, single binary** — no npm, no pip, no runtime. Download and run.
 - **Agent-oriented** — exposes `generate` (with system prompts), `chat` (multi-turn), and `embed`. No admin tools (pull/push/delete) cluttering the tool list.
 - **Designed for [agent-mesh](https://github.com/KTCrisis/agent-mesh)** — works as an upstream MCP server behind policy, tracing, and approval workflows. Also works standalone with any MCP client.
+- **Watchable** — MCP delivers a tool result in one piece, so a long reply is invisible until it is done. This server streams from Ollama and mirrors every token to a trace file as it arrives, reasoning included. `tail -f` and you see the model write.
 
 ## Tools
 
@@ -20,6 +21,15 @@ There are several Ollama MCP servers out there. This one exists because:
 | `generate` | One-shot generation with optional system prompt |
 | `chat` | Multi-turn conversation (system/user/assistant messages) |
 | `embed` | Generate embeddings (for semantic search, RAG, etc.) |
+
+`generate` and `chat` stream internally and mirror their output to a trace
+file — see [Watching a reply as it is written](#watching-a-reply-as-it-is-written).
+The MCP client still receives the reply in one piece, along with the
+`prompt_eval_count` / `eval_count` usage counters.
+
+Conversation state lives entirely on the client: `/api/chat` is stateless, so
+every call sends the whole history. Nothing accumulates server-side, and
+nothing needs clearing here.
 
 ## Install
 
