@@ -32,15 +32,31 @@ type rpcResponse struct {
 type rpcError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Data    any    `json:"data,omitempty"`
 }
 
 // --- MCP types ---
 
 type mcpTool struct {
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	InputSchema mcpSchema `json:"inputSchema"`
+	Name        string          `json:"name"`
+	Title       string          `json:"title,omitempty"`
+	Description string          `json:"description"`
+	InputSchema mcpSchema       `json:"inputSchema"`
+	Annotations *mcpAnnotations `json:"annotations,omitempty"`
 }
+
+// mcpAnnotations are behaviour hints for clients and gateways. All tools
+// here only read: they run a local model and change nothing, and Ollama is
+// local, so nothing reaches an outside system (openWorldHint false).
+type mcpAnnotations struct {
+	ReadOnlyHint    bool `json:"readOnlyHint"`
+	DestructiveHint bool `json:"destructiveHint"`
+	IdempotentHint  bool `json:"idempotentHint"`
+	OpenWorldHint   bool `json:"openWorldHint"`
+}
+
+// version is the server's own version, reported in serverInfo.
+const version = "0.2.0"
 
 type mcpSchema struct {
 	Type       string             `json:"type"`
@@ -63,10 +79,12 @@ type mcpContent struct {
 }
 
 type mcpToolResult struct {
-	Content         []mcpContent `json:"content"`
-	IsError         bool         `json:"isError,omitempty"`
-	PromptEvalCount int          `json:"prompt_eval_count,omitempty"`
-	EvalCount       int          `json:"eval_count,omitempty"`
+	ResultType      string         `json:"resultType"`
+	Content         []mcpContent   `json:"content"`
+	IsError         bool           `json:"isError,omitempty"`
+	Meta            map[string]any `json:"_meta,omitempty"`
+	PromptEvalCount int            `json:"prompt_eval_count,omitempty"`
+	EvalCount       int            `json:"eval_count,omitempty"`
 }
 
 // --- Ollama API types ---
@@ -154,6 +172,8 @@ func newServer() *server {
 var tools = []mcpTool{
 	{
 		Name:        "list_models",
+		Title:       "List models",
+		Annotations: &mcpAnnotations{ReadOnlyHint: true, IdempotentHint: true},
 		Description: "List all available Ollama models",
 		InputSchema: mcpSchema{
 			Type:       "object",
@@ -162,6 +182,8 @@ var tools = []mcpTool{
 	},
 	{
 		Name:        "generate",
+		Title:       "Generate",
+		Annotations: &mcpAnnotations{ReadOnlyHint: true, IdempotentHint: false},
 		Description: "Generate a one-shot response from an Ollama model",
 		InputSchema: mcpSchema{
 			Type: "object",
@@ -175,6 +197,8 @@ var tools = []mcpTool{
 	},
 	{
 		Name:        "chat",
+		Title:       "Chat",
+		Annotations: &mcpAnnotations{ReadOnlyHint: true, IdempotentHint: false},
 		Description: "Send a multi-turn conversation to an Ollama model",
 		InputSchema: mcpSchema{
 			Type: "object",
@@ -191,6 +215,8 @@ var tools = []mcpTool{
 	},
 	{
 		Name:        "embed",
+		Title:       "Embed text",
+		Annotations: &mcpAnnotations{ReadOnlyHint: true, IdempotentHint: true},
 		Description: "Generate embeddings for a text using an Ollama model",
 		InputSchema: mcpSchema{
 			Type: "object",
@@ -203,19 +229,18 @@ var tools = []mcpTool{
 	},
 }
 
-func (s *server) handleInitialize(id json.RawMessage) rpcResponse {
+// handleInitialize serves legacy clients (2025-11-25 and earlier), which open
+// with a handshake; modern ones never send it.
+func (s *server) handleInitialize(id, params json.RawMessage) rpcResponse {
 	return rpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
 		Result: map[string]any{
-			"protocolVersion": "2024-11-05",
+			"protocolVersion": negotiate(params),
 			"capabilities": map[string]any{
 				"tools": map[string]any{"listChanged": false},
 			},
-			"serverInfo": map[string]any{
-				"name":    "ollama-mcp-go",
-				"version": "0.1.0",
-			},
+			"serverInfo": serverInfo,
 		},
 	}
 }
@@ -224,7 +249,13 @@ func (s *server) handleToolsList(id json.RawMessage) rpcResponse {
 	return rpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
-		Result:  map[string]any{"tools": tools},
+		Result: map[string]any{
+			"resultType": "complete",
+			"tools":      tools, // fixed order, so clients and prompt caches can rely on it
+			"ttlMs":      toolsTTLMs,
+			"cacheScope": "public",
+			"_meta":      map[string]any{metaServerInfo: serverInfo},
+		},
 	}
 }
 
@@ -250,6 +281,8 @@ func (s *server) handleToolsCall(id json.RawMessage, params json.RawMessage) rpc
 	default:
 		return s.errorResult(id, "unknown tool: "+call.Name)
 	}
+	result.ResultType = "complete"
+	result.Meta = map[string]any{metaServerInfo: serverInfo}
 
 	return rpcResponse{
 		JSONRPC: "2.0",
@@ -620,23 +653,7 @@ func main() {
 			continue
 		}
 
-		var resp rpcResponse
-		switch req.Method {
-		case "initialize":
-			resp = s.handleInitialize(req.ID)
-		case "tools/list":
-			resp = s.handleToolsList(req.ID)
-		case "tools/call":
-			resp = s.handleToolsCall(req.ID, req.Params)
-		default:
-			resp = rpcResponse{
-				JSONRPC: "2.0",
-				ID:      req.ID,
-				Error:   &rpcError{Code: -32601, Message: "method not found: " + req.Method},
-			}
-		}
-
-		writeResponse(writer, resp)
+		writeResponse(writer, s.dispatch(req))
 	}
 
 	if err := scanner.Err(); err != nil {

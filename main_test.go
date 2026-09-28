@@ -16,7 +16,7 @@ import (
 
 func TestInitialize(t *testing.T) {
 	s := newServer()
-	resp := s.handleInitialize(json.RawMessage(`1`))
+	resp := s.handleInitialize(json.RawMessage(`1`), json.RawMessage(`{"protocolVersion":"2024-11-05"}`))
 
 	result, ok := resp.Result.(map[string]any)
 	if !ok {
@@ -527,15 +527,7 @@ func TestStdioRoundTrip(t *testing.T) {
 			continue
 		}
 
-		var resp rpcResponse
-		switch req.Method {
-		case "initialize":
-			resp = s.handleInitialize(req.ID)
-		case "tools/list":
-			resp = s.handleToolsList(req.ID)
-		case "tools/call":
-			resp = s.handleToolsCall(req.ID, req.Params)
-		}
+		resp := s.dispatch(req)
 
 		data, _ := json.Marshal(resp)
 		fmt.Fprintf(w, "%s\n", data)

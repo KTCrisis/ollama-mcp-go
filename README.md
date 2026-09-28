@@ -174,7 +174,12 @@ generation carries on.
 
 ## Protocol
 
-Implements [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) over stdio transport using JSON-RPC 2.0. Compatible with protocol version `2024-11-05`.
+Implements [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) over stdio, JSON-RPC 2.0, as a **dual-era** server:
+
+- **Modern clients** (spec `2026-07-28`) declare the version on each request in `_meta` and may probe with `server/discover`. An unknown version gets `UnsupportedProtocolVersionError` (`-32022`) listing the supported ones. Results carry `resultType` and `serverInfo` in `_meta`; `tools/list` also carries `ttlMs` and `cacheScope`.
+- **Legacy clients** (`2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`) open with `initialize`, which answers the version they asked for, or `2025-11-25`. `ping` is kept for them; the `2026-07-28` revision removed it.
+
+Every tool has a `title` and annotations: read-only, not destructive, closed world (Ollama is local), idempotent for `list_models` and `embed`. Logs go to stderr.
 
 ## License
 
