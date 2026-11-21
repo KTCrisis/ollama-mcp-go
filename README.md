@@ -41,7 +41,7 @@ cd ollama-mcp-go
 go build -o ollama-mcp-go .
 ```
 
-Requires Go 1.22+ and a running [Ollama](https://ollama.com) instance.
+Requires Go 1.26+ and a running [Ollama](https://ollama.com) instance.
 
 ### Pre-built binaries
 
